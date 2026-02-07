@@ -9,8 +9,10 @@ import folium
 import requests
 from io import BytesIO
 from PIL import Image
+import os
+import json
 
-# Try importing geopy for city naming
+# Try importing geopy
 try:
     from geopy.geocoders import Nominatim
     GEOPY_AVAILABLE = True
@@ -18,17 +20,37 @@ except ImportError:
     GEOPY_AVAILABLE = False
 
 # --- 1. CONFIGURATION ---
-st.set_page_config(layout="wide", page_title="Forest Change AI (Unsupervised)")
+st.set_page_config(layout="wide", page_title="Forest Change AI")
 
 def init_ee():
-    """Initialize Earth Engine securely."""
+    """Initialize Earth Engine using a token from Streamlit Secrets."""
     try:
+        # 1. Try initializing (works if already authenticated locally)
         ee.Initialize()
     except Exception:
-        st.warning("Initializing Earth Engine...")
-        ee.Authenticate()
-        ee.Initialize()
+        # 2. If that fails (like on Cloud), look for the token in Secrets
+        if "earth_engine_token" in st.secrets:
+            # Create the hidden folder structure Earth Engine expects
+            home_dir = os.path.expanduser("~")
+            ee_cred_dir = os.path.join(home_dir, '.config', 'earthengine')
+            os.makedirs(ee_cred_dir, exist_ok=True)
+            cred_path = os.path.join(ee_cred_dir, 'credentials')
+            
+            # Write the secret JSON to the credentials file
+            with open(cred_path, 'w') as f:
+                f.write(st.secrets["earth_engine_token"])
+            
+            # Try initializing again now that the credentials exist
+            try:
+                ee.Initialize()
+            except Exception as e:
+                st.error(f"Authentication failed even with secrets: {e}")
+                st.stop()
+        else:
+            st.error("Earth Engine credentials not found! Please add 'earth_engine_token' to your Streamlit Secrets.")
+            st.stop()
 
+# Run the initialization
 init_ee()
 
 # --- 2. SIDEBAR ---
@@ -43,7 +65,7 @@ year_hist = st.sidebar.selectbox("Historical Year", range(2000, 2015), index=5) 
 year_recent = st.sidebar.selectbox("Recent Year", range(2015, 2024), index=8)   # 2023
 
 st.sidebar.subheader("3. Processing Settings")
-n_clusters = 3 # Fixed to 3 for Loss/Stable/Gain
+n_clusters = 3 
 clean_noise = st.sidebar.checkbox("Apply Noise Filter (Smoother Map)", value=True)
 export_scale = st.sidebar.slider("Export Zoom Scope", 1.0, 3.0, 1.2)
 
@@ -114,7 +136,6 @@ def add_north_arrow(ax):
 st.title("🛰️ AI-Enabled Forest Change (Unsupervised)")
 st.markdown(f"**Target:** {lat}, {lon} | **Algorithm:** K-Means Clustering")
 
-# Initialize Session State
 if 'map_generated' not in st.session_state: st.session_state.map_generated = False
 if 'analysis_done' not in st.session_state: st.session_state.analysis_done = False
 if 'auto_label' not in st.session_state: st.session_state.auto_label = ""
@@ -162,29 +183,24 @@ if st.session_state.analysis_done:
         else:
             result = result_raw
 
-        # G. RELATIVE SORTING LOGIC (The Fix for "All Green" Maps)
-        # 1. Calculate Mean Change for every cluster
+        # G. RELATIVE SORTING LOGIC
+        # 1. Calculate Mean Change
         stats_input = ndvi_diff.addBands(result)
         stats = stats_input.reduceRegion(
             reducer=ee.Reducer.mean().group(groupField=1, groupName='cluster_id'),
             geometry=aoi, scale=100, maxPixels=1e9
         ).getInfo()['groups']
 
-        # 2. Sort clusters by Mean Change (Lowest -> Highest)
-        # Lowest = Loss, Middle = Stable, Highest = Gain
+        # 2. Sort clusters (Lowest=Loss, Middle=Stable, Highest=Gain)
         sorted_stats = sorted(stats, key=lambda x: x['mean'])
         
-        # 3. Create Remap Lists
+        # 3. Remap
         remap_from = [item['cluster_id'] for item in sorted_stats]
-        remap_to = [0, 1, 2] # 0=Loss (Red), 1=Stable (White), 2=Gain (Green)
+        remap_to = [0, 1, 2] # 0=Loss, 1=Stable, 2=Gain
         
-        labels_map = {
-            0: "Degradation/Loss", 
-            1: "Stable", 
-            2: "Regrowth/Gain"
-        }
+        labels_map = {0: "Degradation/Loss", 1: "Stable", 2: "Regrowth/Gain"}
 
-        # 4. Remap the Image for Visualization
+        # 4. Create Visual Image
         final_vis_image = result.remap(remap_from, remap_to)
 
         # H. CALCULATE AREAS
@@ -229,7 +245,6 @@ if st.session_state.analysis_done:
             with st.spinner("Rendering..."):
                 try:
                     vis_params = {'min': 0, 'max': 2, 'palette': ['#ff0000', '#eeeeee', '#00aa00'], 'dimensions': 1000}
-                    # We clip the remapped image for export
                     url = final_vis_image.clip(export_aoi).getThumbURL(vis_params)
                     image_data = download_url(url)
                     pil_img = Image.open(image_data)
@@ -273,7 +288,6 @@ if st.session_state.analysis_done:
         if not df.empty:
             fig, ax = plt.subplots()
             colors = {'Degradation/Loss': '#ff0000', 'Stable': '#cccccc', 'Regrowth/Gain': '#00aa00'}
-            # Safe color mapping
             bar_colors = [colors.get(x, 'blue') for x in df['Class']]
             
             ax.bar(df['Class'], df['Area (sq km)'], color=bar_colors)
